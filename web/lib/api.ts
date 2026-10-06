@@ -470,6 +470,43 @@ export function saveSettings(
   return api("/api/settings", { method: "PATCH", json: { values } });
 }
 
+export type ChatGPTPlanAccount = {
+  client_id: string;
+  label: string | null;
+  email: string | null;
+  connected: boolean;
+  selected: boolean;
+};
+
+/** Safe local registration metadata only. Credentials never enter the browser. */
+export type ChatGPTPlanStatus = {
+  connected: boolean;
+  selected_client_id: string | null;
+  accounts: ChatGPTPlanAccount[];
+  reason: string | null;
+  provider: string | null;
+  model: string | null;
+};
+
+export type ChatGPTPlanModel = { slug: string; display_name: string };
+
+export function chatgptPlanStatus(): Promise<ChatGPTPlanStatus> {
+  return api("/api/settings/chatgpt");
+}
+
+/** Explicit operator action: this asks ChatGPT for this registration's models. */
+export function chatgptPlanModels(clientId?: string): Promise<{ models: ChatGPTPlanModel[] }> {
+  const query = clientId ? `?${new URLSearchParams({ client_id: clientId })}` : "";
+  return api(`/api/settings/chatgpt/models${query}`);
+}
+
+export function selectChatGPTPlan(clientId: string, model: string): Promise<ChatGPTPlanStatus> {
+  return api("/api/settings/chatgpt/select", {
+    method: "POST",
+    json: { client_id: clientId, model },
+  });
+}
+
 /** One token from the configured model, to prove the saved key reaches it. The stream
  *  is closed after the first event, so this costs a request rather than an answer. */
 export function testModel(): Promise<{ reached: boolean; model: string; base_url: string }> {

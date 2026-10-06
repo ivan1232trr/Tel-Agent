@@ -24,6 +24,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 # The default for an OpenAI-compatible endpoint. Named `openai` because that is the
 # shape of the API - `POST /chat/completions` with server-sent events - and not the
@@ -31,7 +32,7 @@ from functools import lru_cache
 # gateway, or anything else that speaks it, by pointing `LLM_BASE_URL` elsewhere.
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
-SUPPORTED_PROVIDERS = ("openai",)
+SUPPORTED_PROVIDERS = ("openai", "chatgpt_plan")
 
 
 class ConfigurationError(RuntimeError):
@@ -46,6 +47,18 @@ class LlmSettings:
     model: str
     api_key: str
     base_url: str
+    chatgpt_auth_dir: str = ""
+    chatgpt_client_id: str = ""
+
+
+def chatgpt_auth_directory() -> Path:
+    """Protected, host-local OAuth storage; never a browser-provided path."""
+    configured = _clean("LLM_CHATGPT_AUTH_DIR")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".config/tel-agent/chatgpt"
+    )
 
 
 def _clean(name: str) -> str:
@@ -102,6 +115,17 @@ def settings_from(
         raise ConfigurationError(
             f"{provider!r} is not a provider this build implements. "
             f"Supported: {', '.join(SUPPORTED_PROVIDERS)}."
+        )
+
+    if provider == "chatgpt_plan":
+        if not model:
+            raise ConfigurationError("Choose a model from the connected ChatGPT account.")
+        return LlmSettings(
+            provider=provider,
+            model=model,
+            api_key="",
+            base_url=DEFAULT_BASE_URL,
+            chatgpt_auth_dir=str(chatgpt_auth_directory()),
         )
 
     missing = [
@@ -273,6 +297,7 @@ AGENT_INSTALLATION_ENVIRONMENT_VARIABLES: frozenset[str] = frozenset(
         "LLM_MODEL",
         "LLM_API_KEY",
         "LLM_BASE_URL",
+        "LLM_CHATGPT_AUTH_DIR",
         # Speech pipeline — Milestone 11.
         "DEEPGRAM_API_KEY",
         "DEEPGRAM_MODEL",

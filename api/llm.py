@@ -26,7 +26,7 @@ import logging
 import os
 import sys
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import httpx
@@ -85,8 +85,27 @@ async def resolve(db: DbSession) -> LlmSettings | None:
     installation that thinks it has a model and does not must not answer as though it
     never had one.
     """
-    stored = await stored_values(db)
+    from api.settings import store
+
+    # OAuth does not need the legacy key. Do not decrypt an unrelated old API
+    # credential, or a key rotation could break the independently stored session.
     environment = environment_values()
+    provider = str(await store.get(db, KEYS["provider"]) or environment["provider"])
+    if provider.strip() == "chatgpt_plan":
+        settings = settings_from(
+            provider=provider,
+            model=str(await store.get(db, KEYS["model"]) or environment["model"]),
+            api_key="",
+            base_url="",
+            names=SCREEN_NAMES,
+        )
+        if settings is None:  # The provider was explicitly selected above.
+            raise ConfigurationError("The ChatGPT provider could not be configured.")
+        return replace(
+            settings,
+            chatgpt_client_id=str(await store.get(db, "llm.chatgpt_client_id") or ""),
+        )
+    stored = await stored_values(db)
     merged = {
         field: stored[field] or environment[field]
         for field in ("provider", "model", "api_key", "base_url")
@@ -127,6 +146,21 @@ async def describe(db: DbSession) -> tuple[str, str | None]:
         return "down", UNREADABLE_KEY
     if settings is None:
         return "not_configured", None
+    if settings.provider == "chatgpt_plan":
+        from pathlib import Path
+
+        from agent.chatgpt_auth import ChatGPTAuthError, ChatGPTAuthStore
+
+        try:
+            auth = ChatGPTAuthStore(Path(settings.chatgpt_auth_dir))
+            state = await asyncio.to_thread(auth.status)
+            selected = settings.chatgpt_client_id or state.get("selected_client_id")
+            account = next((a for a in state["accounts"] if a["client_id"] == selected), None)
+            if not account or not account["connected"]:
+                return "down", "The selected ChatGPT account needs local sign-in."
+        except ChatGPTAuthError as error:
+            return "down", str(error)
+        return "ok", f"{settings.model} using the selected ChatGPT plan"
     # The model and where it lives. Never the key - this endpoint is admin-only, and
     # that is not a reason to hand one back.
     return "ok", f"{settings.model} at {settings.base_url}"

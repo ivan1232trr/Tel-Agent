@@ -14,6 +14,19 @@ and opens the dashboard in the browser at `http://localhost:38471`. It is not a 
 | macOS | Unsigned `.pkg` installer, Apple Silicon and Intel | Available from a release (v0.1.1) |
 | Shared hosting control panels | — | Unsupported; the application needs long-running services and WebSockets |
 
+## ChatGPT plan storage in Docker
+
+The source and release Compose files use the same `tel-agent-chatgpt-auth` named
+volume at `/var/lib/tel-agent/chatgpt`, writable only by the application user.
+The API and the current in-process agent reply loop use that same directory.
+It holds protected OAuth state separately from the database volume; it is not
+included in ordinary database backup/restore. Keep it across container rebuilds
+and do not use `docker compose down -v` when retaining the installation.
+
+Use an image built from a revision that includes the provider, or a published
+release confirmed to include it. See [ChatGPT plan setup](CHATGPT_PLAN.md) for
+the owner-operated local sign-in, VM import, permissions, and recovery steps.
+
 ## Windows upgrades
 
 The Windows installer is self-contained: it carries the Python and Node runtimes, the

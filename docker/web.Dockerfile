@@ -50,4 +50,7 @@ ENV NODE_ENV=production \
 
 EXPOSE 38471
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["node", "-e", "const http=require('node:http');const r=http.get('http://127.0.0.1:38471/en/login',s=>{s.resume();process.exit(s.statusCode>=200&&s.statusCode<400?0:1)});r.on('error',()=>process.exit(1));r.setTimeout(4000,()=>{r.destroy();process.exit(1)})"]
+
 CMD ["node", "web/server.js"]

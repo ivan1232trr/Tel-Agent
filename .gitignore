@@ -8,6 +8,11 @@
 *.key
 secrets/
 credentials.json
+# ChatGPT plan OAuth state and owner-operated import files. Never publish tokens.
+.chatgpt-auth/
+chatgpt-auth/
+registration-*.json
+chatgpt-import*.json
 
 # ---------------------------------------------------------------------------
 # Call data — recordings and transcripts are personal data (GDPR).

@@ -42,13 +42,19 @@ COPY docker/api-entrypoint.sh /entrypoint.sh
 RUN mkdir -p /data && chown telagent:telagent /data /app
 VOLUME /data
 
+# Docker copies this owner-only directory's metadata into a fresh named volume.
+# Keep OAuth credentials away from /data and its routine database backups. Both
+# the API and agent reply loop run as telagent and need writable refresh state.
+RUN install -d -m 0700 -o telagent -g telagent /var/lib/tel-agent/chatgpt
+
 USER telagent
 
 # Inside the container the server must listen on the bridge interface - the host
 # decides what is published, and the compose file publishes loopback only.
 ENV BIND_HOST=0.0.0.0 \
     BIND_PORT=38472 \
-    DATABASE_URL=sqlite+aiosqlite:////data/tel-agent.db
+    DATABASE_URL=sqlite+aiosqlite:////data/tel-agent.db \
+    LLM_CHATGPT_AUTH_DIR=/var/lib/tel-agent/chatgpt
 
 EXPOSE 38472
 

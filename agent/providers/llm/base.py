@@ -23,8 +23,8 @@ manager rather than collecting first.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict
 
 from agent.tools import Tool
@@ -44,6 +44,8 @@ class Message(TypedDict, total=False):
     tool_calls: list[dict[str, Any]]
     tool_call_id: str
     name: str
+    # Opaque Responses output retained for the next tool round, including reasoning.
+    response_items: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,8 @@ class ToolCall:
     id: str
     name: str
     arguments: str
+    # Request-local context, carried through history rather than a provider cache.
+    response_items: list[dict[str, Any]] | None = field(default=None, repr=False, compare=False)
 
 
 Event = TextDelta | ToolCall
@@ -75,7 +79,7 @@ class LLMProvider(Protocol):
 
     def stream(
         self, messages: list[Message], tools: Sequence[Tool] | None = None
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         """The reply, in the pieces it becomes available in.
 
         Yields text as the model produces it, in order, and a `ToolCall` for each tool

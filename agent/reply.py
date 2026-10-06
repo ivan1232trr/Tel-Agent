@@ -197,6 +197,10 @@ async def reply(
         }
         if spoken:
             asked["content"] = "".join(spoken)
+        if calls[0].response_items is not None:
+            # Responses reasoning and namespace context belongs to this exact turn.
+            # Keeping it on the message also isolates concurrent conversations.
+            asked["response_items"] = calls[0].response_items
         messages.append(asked)
 
         for call in calls:

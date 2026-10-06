@@ -226,9 +226,22 @@ to run the code without rebuilding an image on every edit. See
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the manual run, [`docs/SPEC.md`](docs/SPEC.md)
 for the full design and [`CLAUDE.md`](CLAUDE.md) for the development rules.
 
+### Use a ChatGPT plan for the language model
+
+The optional `chatgpt_plan` provider uses official Sign in with ChatGPT and the
+connected account's eligible plan allowance. It is separate from an OpenAI API
+key, remains subject to plan limits, and never silently switches to paid API
+billing. STT, TTS and telephony are configured separately.
+
+For the owner-run local sign-in, secure self-hosted VM import, persistent Docker
+storage and eligibility limits, follow [`docs/CHATGPT_PLAN.md`](docs/CHATGPT_PLAN.md).
+The open-source self-hosted flow does not establish eligibility for a hosted
+commercial service.
+
 ### Requirements for the phone channel
 
-- API keys for an STT, an LLM, and a TTS provider (or a GPU for local models)
+- Configured STT, LLM and TTS providers: their own API keys, an eligible ChatGPT
+  plan for the LLM only, or a supported local model setup
 - A machine on the same LAN as the PBX
 - Network access to the PBX on 5060/UDP and an open RTP port range
 - A SIP endpoint. Most lines already are one:

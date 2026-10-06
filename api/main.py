@@ -53,6 +53,7 @@ from api.routes import auth as auth_routes
 from api.routes import backup as backup_routes
 from api.routes import calendar as calendar_routes
 from api.routes import catalogue as catalogue_routes
+from api.routes import chatgpt_plan as chatgpt_plan_routes
 from api.routes import contacts as contact_routes
 from api.routes import conversations as conversation_routes
 from api.routes import discord_channel as discord_channel_routes
@@ -557,6 +558,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(backup_routes.router)
     app.include_router(conversation_routes.router)
     app.include_router(settings_routes.router)
+    app.include_router(chatgpt_plan_routes.router)
     app.include_router(recovery_routes.router)
     app.include_router(workspace_routes.router)
     app.include_router(invite_routes.router)

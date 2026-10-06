@@ -71,6 +71,11 @@ REGISTRY: dict[str, Definition] = _define(
         description="The model name the endpoint expects, for example gpt-4o-mini.",
     ),
     Definition(
+        "llm.chatgpt_client_id",
+        "installation",
+        description="The selected local ChatGPT registration. No token is stored here.",
+    ),
+    Definition(
         "llm.api_key",
         "installation",
         secret=True,

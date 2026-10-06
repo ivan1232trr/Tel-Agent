@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from typing import Any
 
 import httpx
@@ -57,7 +57,7 @@ class OpenAICompatibleLLM:
 
     async def stream(
         self, messages: list[Message], tools: Sequence[Tool] | None = None
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         """The model's reply, in the order it is produced."""
         payload: dict[str, Any] = {
             "model": self._settings.model,
@@ -85,7 +85,7 @@ class OpenAICompatibleLLM:
         url: str,
         payload: dict[str, Any],
         headers: dict[str, str],
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         # Keyed by the index the wire uses, because a model may assemble two calls at
         # once and the fragments of one carry no other way of telling them apart.
         pending: dict[int, dict[str, str]] = {}

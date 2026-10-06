@@ -8,6 +8,13 @@ __pycache__
 *.pyc
 *.egg-info
 .env
+.env.*
+.chatgpt-auth/
+chatgpt-auth/
+**/registration-*.json
+**/chatgpt-import*.json
+secrets/
+credentials.json
 *.db
 *.db-*
 var/

@@ -237,8 +237,10 @@ async def test_model(
 
     import httpx
 
+    from agent.chatgpt_auth import ChatGPTAuthError
     from agent.config import ConfigurationError
     from agent.providers.llm import provider_for
+    from agent.providers.llm.chatgpt_plan import ChatGPTPlanError
     from api import llm
     from api.security.crypto import DecryptionFailed
 
@@ -269,14 +271,21 @@ async def test_model(
             "the key above, save, then test.",
         )
 
-    provider = provider_for(settings)
     try:
+        provider = provider_for(settings)
         async with aclosing(provider.stream([{"role": "user", "content": "ping"}])) as stream:
             async for _event in stream:
                 # An empty stream is a valid answer to "say nothing" (§B3), so arriving
                 # here is not what proves the endpoint works - returning without an
                 # exception is. This breaks only so the request is not paid in full.
-                break
+                if settings.provider != "chatgpt_plan":
+                    break
+    except (ChatGPTAuthError, ChatGPTPlanError) as refused:
+        return envelope_response(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            code="chatgpt_unavailable",
+            message=str(refused),
+        )
     except httpx.HTTPStatusError as refused:
         return envelope_response(
             status_code=status.HTTP_502_BAD_GATEWAY,

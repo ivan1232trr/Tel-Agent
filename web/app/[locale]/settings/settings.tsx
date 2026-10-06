@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useState, useSyncExternalStore } from "react";
 
 import { ChannelCard } from "@/components/channels/generic-card";
+import { ChatGPTPlanSettings } from "@/components/settings/chatgpt-plan";
 import { LiveSettings, type FieldCopy } from "@/components/settings/live-settings";
 import { Sidebar } from "@/components/shell/sidebar";
 import { StatePreview, type ScreenState } from "@/components/state-preview";
@@ -444,6 +445,7 @@ export function Settings({ locale, t }: { locale: Locale; t: SettingsDictionary 
                     ) : null}
                     {tab === "advanced" ? (
                       <>
+                        <ChatGPTPlanSettings t={t} />
                         <div className="border-od-line bg-od-panel-deep-3 rounded-[10px] border">
                           <SectionHead title={t.model_title} note={t.live_note} />
                           <LiveSettings fields={modelFields(t)} labels={liveLabels(t)} />

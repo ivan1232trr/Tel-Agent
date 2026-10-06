@@ -24,13 +24,21 @@ services:
       DATABASE_URL: ${TEL_AGENT_DATABASE_URL:-sqlite+aiosqlite:////data/tel-agent.db}
       CORS_ORIGINS: ${TEL_AGENT_WEB_ORIGIN:-http://localhost:38471}
       TRUSTED_HOSTS: ${TEL_AGENT_TRUSTED_HOSTS:-localhost,127.0.0.1}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      # Use a release that includes ChatGPT plan support; see docs/CHATGPT_PLAN.md.
+      LLM_CHATGPT_AUTH_DIR: /var/lib/tel-agent/chatgpt
     volumes:
       - tel-agent-data:/data
+      - tel-agent-chatgpt-auth:/var/lib/tel-agent/chatgpt
     ports:
       - "${TEL_AGENT_API_LISTEN:-127.0.0.1:38472}:38472"
 
@@ -70,5 +78,6 @@ services:
 
 volumes:
   tel-agent-data:
+  tel-agent-chatgpt-auth:
   tel-agent-postgres:
   tel-agent-n8n:
