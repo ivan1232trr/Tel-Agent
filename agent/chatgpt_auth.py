@@ -1,7 +1,8 @@
 """Official ChatGPT plan-use OAuth for an owner-operated, self-hosted runtime.
 
-Credentials never enter the dashboard or the settings database. The runtime owner
-uses the local CLI, then owns this protected directory (0700, files 0600). Unix
+Credentials never enter the settings database. The runtime owner uses the local
+CLI or explicitly imports a local registration through the protected dashboard,
+then owns this protected directory (0700, files 0600). Unix
 file locks serialize rotating refresh tokens across API and agent processes. No
 browser, callback, code exchange or grant is initiated by constructing a store.
 
@@ -14,6 +15,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -61,7 +63,29 @@ _TOKEN_FIELDS = (
 )
 _MAX_FILE_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 1024 * 1024
+_MAX_JSON_DEPTH = 16
 _CLIENT_ID = re.compile(r"oaiapp_[A-Za-z0-9_-]{1,200}\Z")
+_IMPORT_FIELDS = frozenset(
+    {
+        "version",
+        "issuer",
+        "subject",
+        "client_id",
+        "email",
+        "label",
+        "ext_agent_host_id",
+        "id_token",
+        "nonce",
+        "access_token",
+        "refresh_token",
+        "token_type",
+        "scopes",
+        "expires_at",
+        "earliest_refresh_at",
+        "saved_at",
+        "revision",
+    }
+)
 
 
 class ChatGPTAuthError(RuntimeError):
@@ -118,16 +142,59 @@ def _protected_stat(info: os.stat_result, *, directory: bool = False) -> None:
         )
 
 
-def _read_private(path: Path) -> dict[str, Any]:
-    """Open without following a symlink, check the opened inode, and bound parsing."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as source:
-        _protected_stat(os.fstat(source.fileno()))
-        raw = source.read(_MAX_FILE_BYTES + 1)
+def _credential_json(raw: bytes) -> dict[str, Any]:
+    """Parse bounded, unambiguous UTF-8 JSON without exposing rejected contents."""
+    if not isinstance(raw, bytes):
+        raise ChatGPTAuthError("invalid_storage", "The ChatGPT credential file is invalid.")
     if len(raw) > _MAX_FILE_BYTES:
         raise ChatGPTAuthError("invalid_storage", "The ChatGPT credential file is too large.")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> Any:
+        raise ValueError
+
     try:
-        value = json.loads(raw)
+        source = raw.decode("utf-8", errors="strict")
+        # Bound nesting before the JSON decoder allocates a deeply nested tree.
+        depth, quoted, escaped = 0, False, False
+        for character in source:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    quoted = False
+            elif character == '"':
+                quoted = True
+            elif character in "[{":
+                depth += 1
+                if depth > _MAX_JSON_DEPTH:
+                    raise ValueError
+            elif character in "]}":
+                depth -= 1
+        value = json.loads(
+            source, object_pairs_hook=unique_object, parse_constant=reject_constant
+        )
+        pending = [value]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                item.encode("utf-8", errors="strict")  # Reject escaped lone surrogates.
+            elif isinstance(item, float) and not math.isfinite(item):
+                raise ValueError
+            elif isinstance(item, dict):
+                pending.extend(item)
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
     except (ValueError, UnicodeError, RecursionError):
         raise ChatGPTAuthError(
             "invalid_storage", "The ChatGPT credential file is invalid."
@@ -135,6 +202,33 @@ def _read_private(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ChatGPTAuthError("invalid_storage", "The ChatGPT credential file is invalid.")
     return value
+
+
+def _read_private(path: Path) -> dict[str, Any]:
+    """Open without following a symlink, check the opened inode, and bound parsing."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        _protected_stat(os.fstat(source.fileno()))
+        raw = source.read(_MAX_FILE_BYTES + 1)
+    return _credential_json(raw)
+
+
+def _import_text(value: Any, *, maximum: int, optional: bool = False) -> str | None:
+    if optional and value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ChatGPTAuthError("invalid_storage", "The imported ChatGPT session is invalid.")
+    return value
+
+
+def _check_import_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise ChatGPTAuthError("import_cancelled", "The ChatGPT import was cancelled.")
 
 
 def _atomic_private(path: Path, value: dict[str, Any]) -> None:
@@ -238,7 +332,7 @@ class _Attempt:
 
 
 class ChatGPTAuthStore:
-    """Isolated account registrations in protected runtime storage, never in a browser.
+    """Isolated account registrations in protected runtime storage, never in responses.
 
     `status`, `accounts` and `select` expose metadata only. Call those small disk
     operations through `asyncio.to_thread` from an async API. `access_token` already
@@ -946,51 +1040,220 @@ class ChatGPTAuthStore:
                 ),
             }
 
-    def import_registration(self, source: Path) -> dict[str, Any]:
-        """Import one owner-transferred protected file; never overwrite the VM host ID.
+    def _validated_import(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        """Validate the Tel-Agent record schema; retain only canonical fields.
 
-        The operator, not an assistant or browser upload, transfers this file over SSH.
-        Retained ID tokens may have expired; their signatures/issuer/audience/identity
-        are still checked. The transferred session's credentials must have one owner:
-        stop using the source runtime before the VM performs rotating refreshes.
+        A retained ID token authenticates issuer/client/subject, not an arbitrary
+        refresh token or an unsigned scope list. No undocumented access-token
+        claims or introspection endpoint are assumed. OIDC at_hash, when present,
+        must bind the supplied access token; an old nonmatching hint fails closed.
+        The owner must transfer a complete, unmodified record from their runtime.
         """
-        with self._locked():
-            host = self._host()  # Must exist before loading a laptop's credential record.
-            incoming = _read_private(Path(source))
-            client_id = _client_id(incoming.get("client_id"))
-            identity = self._validate_id_token(
-                _required_text(incoming.get("id_token"), "identity token"),
-                client_id,
-                allow_expired=True,
+        if set(incoming) - _IMPORT_FIELDS or type(incoming.get("version")) is not int:
+            raise ChatGPTAuthError(
+                "invalid_storage", "The imported ChatGPT session is invalid."
             )
-            if incoming.get("subject") != identity["sub"] or incoming.get("issuer") != ISSUER:
+        if incoming["version"] != 1 or incoming.get("issuer") != ISSUER:
+            raise ChatGPTAuthError(
+                "invalid_storage", "The imported ChatGPT session is invalid."
+            )
+        client_id = _client_id(incoming.get("client_id"))
+        subject = _import_text(incoming.get("subject"), maximum=1024)
+        label = _import_text(incoming.get("label"), maximum=200, optional=True) or client_id
+        email = _import_text(incoming.get("email"), maximum=320, optional=True)
+        nonce = _import_text(incoming.get("nonce"), maximum=1024, optional=True)
+        for name in ("ext_agent_host_id", "revision"):
+            _import_text(incoming.get(name), maximum=200, optional=True)
+        tokens: dict[str, str] = {}
+        for name in ("access_token", "refresh_token", "id_token"):
+            token = _required_text(incoming.get(name), "session token")
+            if any(not 33 <= ord(character) <= 126 for character in token):
                 raise ChatGPTAuthError(
-                    "identity_mismatch", "The imported ChatGPT identity does not match."
+                    "invalid_storage", "The imported ChatGPT session is invalid."
                 )
-            for name in ("access_token", "refresh_token"):
-                _required_text(incoming.get(name), name)
-            scopes = incoming.get("scopes")
-            if (
-                not isinstance(scopes, list)
-                or not all(isinstance(item, str) for item in scopes)
-                or not PLAN_SCOPES.issubset(scopes)
-                or not _number(incoming.get("expires_at"))
+            tokens[name] = token
+        token_type = incoming.get("token_type")
+        scopes = incoming.get("scopes")
+        if (
+            not isinstance(token_type, str)
+            or token_type.lower() != "bearer"
+            or not isinstance(scopes, list)
+            or not 1 <= len(scopes) <= 64
+            or not all(
+                isinstance(item, str)
+                and 1 <= len(item) <= 256
+                and all(33 <= ord(character) <= 126 for character in item)
+                and '"' not in item
+                and "\\" not in item
+                for item in scopes
+            )
+            or len(set(scopes)) != len(scopes)
+            or not PLAN_SCOPES.issubset(scopes)
+        ):
+            raise ChatGPTAuthError(
+                "invalid_storage", "The imported ChatGPT session is incomplete."
+            )
+        expires_at = _number(incoming.get("expires_at"), -1)
+        saved_at = _number(incoming.get("saved_at"), -1)
+        earliest_refresh_at = _number(incoming.get("earliest_refresh_at", 0), -1)
+        if expires_at <= 0 or saved_at <= 0 or earliest_refresh_at < 0:
+            raise ChatGPTAuthError("invalid_storage", "The imported ChatGPT expiry is invalid.")
+        if saved_at > time.time() + 300:
+            raise ChatGPTAuthError("invalid_storage", "The imported ChatGPT expiry is invalid.")
+        identity = self._validate_id_token(tokens["id_token"], client_id, allow_expired=True)
+        if subject != identity["sub"]:
+            raise ChatGPTAuthError(
+                "identity_mismatch", "The imported ChatGPT identity does not match."
+            )
+        verified_email = _import_text(identity.get("email"), maximum=320, optional=True)
+        if email is not None and email != verified_email:
+            raise ChatGPTAuthError(
+                "identity_mismatch", "The imported ChatGPT identity does not match."
+            )
+        if nonce is not None and "nonce" in identity:
+            if not isinstance(identity["nonce"], str) or not secrets.compare_digest(
+                nonce.encode(), identity["nonce"].encode()
             ):
                 raise ChatGPTAuthError(
-                    "invalid_storage", "The imported ChatGPT session is incomplete."
+                    "invalid_identity", "The ChatGPT identity token could not be verified."
                 )
-            path = self._record_path(client_id)
-            if path.exists() and self._record(client_id)["subject"] != identity["sub"]:
+        if "at_hash" in identity:
+            # Both supported ID-token algorithms, RS256 and ES256, use SHA-256.
+            digest = hashlib.sha256(tokens["access_token"].encode("ascii")).digest()
+            expected = base64.urlsafe_b64encode(digest[: len(digest) // 2]).rstrip(b"=")
+            if not isinstance(identity["at_hash"], str) or not secrets.compare_digest(
+                expected, identity["at_hash"].encode()
+            ):
                 raise ChatGPTAuthError(
-                    "identity_mismatch",
-                    "The imported account conflicts with a saved registration.",
+                    "invalid_identity", "The ChatGPT access token could not be verified."
                 )
-            incoming["ext_agent_host_id"] = host["ext_agent_host_id"]
-            incoming["revision"] = uuid.uuid4().hex
-            _atomic_private(path, incoming)
-            host["selected_client_id"] = client_id
-            _atomic_private(self.directory / "host.json", host)
-            return self._metadata(incoming, client_id)
+        record = {
+            "version": 1,
+            "issuer": ISSUER,
+            "client_id": client_id,
+            "subject": subject,
+            "label": label,
+            "email": verified_email,
+            "token_type": "Bearer",
+            "scopes": sorted(scopes),
+            "expires_at": expires_at,
+            "saved_at": saved_at,
+            "earliest_refresh_at": earliest_refresh_at,
+            **tokens,
+        }
+        if nonce is not None:
+            record["nonce"] = nonce
+        self._import_metadata(record, client_id)
+        return record
+
+    def _import_metadata(self, record: dict[str, Any], client_id: str) -> dict[str, Any]:
+        """Reject credential reflection even when JSON would escape its text."""
+        metadata = self._metadata(record, client_id)
+        displayed = [value for value in metadata.values() if isinstance(value, str)]
+        displayed.extend(metadata["scopes"])
+        for name in ("access_token", "refresh_token", "id_token"):
+            token = record.get(name)
+            if isinstance(token, str) and any(token in value for value in displayed):
+                raise ChatGPTAuthError(
+                    "invalid_storage", "The imported ChatGPT metadata is invalid."
+                )
+        if not metadata["connected"]:
+            raise ChatGPTAuthError(
+                "plan_permission_missing", "Enable ChatGPT plan usage for this registration."
+            )
+        return metadata
+
+    def _import_registration(
+        self,
+        incoming: dict[str, Any],
+        *,
+        uploaded: bool,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        _check_import_cancelled(cancelled)
+        try:
+            record = self._validated_import(incoming)
+        except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+            raise ChatGPTAuthError(
+                "invalid_storage", "The imported ChatGPT session is invalid."
+            ) from None
+        _check_import_cancelled(cancelled)
+        # Validation may perform public JWKS reads. Re-read current credentials
+        # under the refresh lock afterwards, so a concurrent refresh wins.
+        with self._locked():
+            _check_import_cancelled(cancelled)
+            client_id = record["client_id"]
+            path = self._record_path(client_id)
+            identical = False
+            if path.exists():
+                old = self._record(client_id)
+                if old["subject"] != record["subject"]:
+                    raise ChatGPTAuthError(
+                        "identity_mismatch",
+                        "The imported account conflicts with a saved registration.",
+                    )
+                identical = all(
+                    old.get(name) == record[name]
+                    for name in ("access_token", "refresh_token", "id_token")
+                )
+                if identical:
+                    # An idempotent retry cannot edit grant, expiry or display data.
+                    record = old
+                elif (
+                    (uploaded and self._metadata(old, client_id)["connected"])
+                    or record["saved_at"] <= _number(old.get("saved_at"))
+                    or record["expires_at"] < _number(old.get("expires_at"))
+                ):
+                    raise ChatGPTAuthError(
+                        "account_changed",
+                        "This ChatGPT registration already has different or newer credentials. "
+                        "Keep the saved registration or authorize a separate registration.",
+                    )
+            metadata = self._import_metadata(record, client_id)
+            _check_import_cancelled(cancelled)
+            host = self._host()  # A transferred host ID never identifies this runtime.
+            if not identical:
+                record["ext_agent_host_id"] = host["ext_agent_host_id"]
+                record["revision"] = uuid.uuid4().hex
+                _check_import_cancelled(cancelled)
+                _atomic_private(path, record)
+            if host.get("selected_client_id") != client_id:
+                host["selected_client_id"] = client_id
+                _check_import_cancelled(cancelled)
+                _atomic_private(self.directory / "host.json", host)
+            return metadata
+
+    def import_registration(self, source: Path) -> dict[str, Any]:
+        """Import an owner-transferred 0600 file without replacing this host's ID.
+
+        The explicit local CLI can replace same-account credentials only when its
+        timestamps do not roll back the saved session. It uses the same strict
+        schema and signature checks as uploads. Stop the source runtime before
+        this runtime performs rotating refreshes; credentials must have one owner.
+        """
+        with _safe_storage():
+            return self._import_registration(_read_private(Path(source)), uploaded=False)
+
+    def import_registration_bytes(
+        self, data: bytes, *, cancelled: Callable[[], bool] | None = None
+    ) -> dict[str, Any]:
+        """Import a user-selected UTF-8 registration, with no temporary upload file.
+
+        Limit: 1 MiB. Unknown fields and ambiguous JSON fail closed. Uploads never
+        replace a working same-client token set: their timestamps are unsigned,
+        so they cannot prove freshness after rotating refresh. Identical tokens
+        are an idempotent selection, retaining all existing metadata.
+
+        Async callers must offload this operation and retain the worker until it
+        finishes. Cancelling asyncio.to_thread does not terminate its thread.
+        Set cancelled on request cancellation; it is checked under the refresh
+        lock before writes. Cancellation after an atomic write is outcome-unknown
+        and cannot undo it; inspect status instead of automatically retrying.
+        """
+        _check_import_cancelled(cancelled)
+        return self._import_registration(
+            _credential_json(data), uploaded=True, cancelled=cancelled
+        )
 
 
 async def get_access_token(store: ChatGPTAuthStore, client_id: str | None = None) -> str:

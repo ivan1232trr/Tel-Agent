@@ -1,15 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { SettingsDictionary } from "@/app/[locale]/settings/page";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   ApiError,
+  CHATGPT_IMPORT_MAX_BYTES,
+  ChatGPTPlanImportError,
   OfflineError,
+  chatgptPlanImportAllowed,
   chatgptPlanModels,
   chatgptPlanStatus,
+  importChatGPTPlan,
   selectChatGPTPlan,
   type ChatGPTPlanAccount,
   type ChatGPTPlanModel,
@@ -52,11 +56,30 @@ export function ChatGPTPlanSettings({ t }: { t: SettingsDictionary }) {
   } | null>(null);
   const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [hasImportFile, setHasImportFile] = useState(false);
   const [notice, setNotice] = useState<{ text: string; bad: boolean } | null>(null);
   // Account changes and unmounts invalidate late replies. A ref also closes the gap
   // before React renders disabled buttons after a repeated click.
   const request = useRef(0);
   const pending = useRef(false);
+  const importInput = useRef<HTMLInputElement>(null);
+  const attachImportInput = useCallback((node: HTMLInputElement | null) => {
+    importInput.current = node;
+    if (!node) return;
+    setHasImportFile(false);
+    const cancelSelection = () => {
+      node.value = "";
+      setHasImportFile(false);
+    };
+    // The native file-picker cancel event is not exposed by React's input props.
+    node.addEventListener("cancel", cancelSelection);
+    return () => {
+      node.removeEventListener("cancel", cancelSelection);
+      node.value = "";
+      importInput.current = null;
+    };
+  }, []);
 
   useEffect(() => () => {
     request.current += 1;
@@ -73,9 +96,11 @@ export function ChatGPTPlanSettings({ t }: { t: SettingsDictionary }) {
   const active = data?.provider === "chatgpt_plan";
   const validModel = models?.some((entry) => entry.slug === model) ?? false;
   const alreadySelected = active && data?.selected_client_id === clientId && data?.model === model;
-  const controlsDisabled = status.loading || saving;
+  const controlsDisabled = status.loading || saving || importing;
+  const importAllowed = chatgptPlanImportAllowed();
 
   function changeAccount(value: string) {
+    if (controlsDisabled) return;
     request.current += 1;
     pending.current = false;
     setChosenClientId(value);
@@ -86,10 +111,67 @@ export function ChatGPTPlanSettings({ t }: { t: SettingsDictionary }) {
   }
 
   function refreshStatus() {
-    if (pending.current) return;
+    if (pending.current || controlsDisabled) return;
     changeAccount("");
     setChosenClientId(null);
     status.reload();
+  }
+
+  function clearImportFile() {
+    if (importInput.current) importInput.current.value = "";
+    setHasImportFile(false);
+  }
+
+  function chooseImportFile() {
+    if (pending.current || controlsDisabled) return;
+    const file = importInput.current?.files?.item(0);
+    setNotice(null);
+    if (!file) {
+      clearImportFile();
+      return;
+    }
+    if (file.size === 0 || file.size > CHATGPT_IMPORT_MAX_BYTES) {
+      clearImportFile();
+      setNotice({ text: t.chatgpt_import_file_error, bad: true });
+      return;
+    }
+    setHasImportFile(true);
+  }
+
+  async function importRegistration() {
+    if (pending.current || controlsDisabled || !data?.can_import || !importAllowed) return;
+    const file = importInput.current?.files?.item(0);
+    if (!file) return;
+    pending.current = true;
+    const version = ++request.current;
+    setImporting(true);
+    setNotice(null);
+    try {
+      await importChatGPTPlan(file);
+      if (request.current !== version) return;
+      setChosenClientId(null);
+      setCatalogue(null);
+      setModel("");
+      setNotice({ text: t.chatgpt_import_saved, bad: false });
+      status.reload();
+    } catch (thrown) {
+      if (request.current !== version) return;
+      const kind = thrown instanceof ChatGPTPlanImportError ? thrown.kind : "unknown";
+      const text = kind === "insecure" ? t.chatgpt_import_https
+        : kind === "file" ? t.chatgpt_import_file_error
+        : kind === "forbidden" ? t.chatgpt_forbidden
+        : kind === "rejected" ? t.chatgpt_import_failed
+        : t.chatgpt_import_unknown;
+      setNotice({ text, bad: true });
+      // Only local status is refreshed; no upload retry or upstream request.
+      status.reload();
+    } finally {
+      if (request.current === version) {
+        pending.current = false;
+        setImporting(false);
+        clearImportFile();
+      }
+    }
   }
 
   async function refreshModels() {
@@ -230,6 +312,31 @@ export function ChatGPTPlanSettings({ t }: { t: SettingsDictionary }) {
               </div>
             </fieldset>
           ) : null}
+
+          {data.can_import ? (
+            <fieldset disabled={controlsDisabled || loadingModels || !importAllowed} className="border-od-line m-0 flex min-w-0 flex-col gap-3 rounded-[7px] border p-3">
+              <legend className="text-od-text-3 px-1 text-[13px] font-medium">{t.chatgpt_import_title}</legend>
+              <p id="chatgpt-import-help" className="text-od-muted-5 m-0 text-[13px] text-pretty">{t.chatgpt_import_help}</p>
+              {!importAllowed ? <p role="status" className="text-od-muted-5 m-0 text-[13px]">{t.chatgpt_import_https}</p> : null}
+              <label htmlFor="chatgpt-import-file" className="text-od-text-3 text-[13px] font-medium">{t.chatgpt_import_file}</label>
+              <input
+                ref={attachImportInput}
+                id="chatgpt-import-file"
+                type="file"
+                accept=".json,application/json"
+                aria-describedby="chatgpt-import-help chatgpt-import-confirm"
+                onChange={chooseImportFile}
+                className="text-od-text-2 w-full min-w-0 text-[13px] file:me-3 file:rounded-[7px] file:border file:px-3 file:py-2 disabled:opacity-50"
+              />
+              <p id="chatgpt-import-confirm" className="text-od-muted-5 m-0 text-[13px] text-pretty">{t.chatgpt_import_confirm}</p>
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" onClick={importRegistration} disabled={!hasImportFile} aria-describedby="chatgpt-import-confirm">
+                  {importing ? t.chatgpt_importing : t.chatgpt_import_upload}
+                </Button>
+                {hasImportFile ? <Button type="button" variant="outline" onClick={clearImportFile}>{t.chatgpt_import_cancel}</Button> : null}
+              </div>
+            </fieldset>
+          ) : null}
         </>
       ) : null}
 
@@ -246,7 +353,7 @@ export function ChatGPTPlanSettings({ t }: { t: SettingsDictionary }) {
       </div>
 
       <div className="flex flex-wrap gap-2">
-        <Button type="button" variant="outline" onClick={refreshStatus} disabled={status.loading || loadingModels || saving}>
+        <Button type="button" variant="outline" onClick={refreshStatus} disabled={controlsDisabled || loadingModels}>
           {status.loading ? t.live_loading : t.chatgpt_refresh_status}
         </Button>
       </div>

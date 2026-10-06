@@ -34,9 +34,11 @@ Official documentation (checked 2026-10-06):
 
 ## Storage and process boundaries
 
-The owner runs the CLI to sign in. There is no dashboard credential upload, token
-paste box or server-side browser login. Never paste credential files, tokens,
-authorization callback URLs or browser cookies into chat, tickets or logs.
+The owner runs the CLI to sign in. An authenticated workspace owner can then
+transfer one existing registration through the HTTPS dashboard's file picker.
+There is no token paste box or server-side browser login. Never paste credential
+files, tokens, authorization callback URLs or browser cookies into chat, tickets
+or logs. An assistant must not read or upload the credential file for you.
 
 The CLI requires a POSIX environment: Linux, macOS or WSL. Install the repository's
 Python dependencies as described in [CONTRIBUTING.md](../CONTRIBUTING.md), then run
@@ -150,6 +152,29 @@ registration=$(python -c 'import hashlib, sys; print("registration-" + hashlib.s
 Stop using this local session for model discovery or inference before transferring
 it. The VM will own future token refreshes. Do **not** sign out the copied local
 session as a cleanup step: revocation can invalidate the transferred session too.
+
+#### HTTPS dashboard import (no SSH required)
+
+If sign-in has already succeeded locally, do not repeat it. Sign in to your
+Tel-Agent dashboard as a workspace **owner**, then open **Settings → Advanced →
+ChatGPT plan → Import an existing registration**. Select the registration JSON
+file with the native file picker, review the destination notice, and choose
+**Upload and import** yourself. Do not upload `host.json` or a Codex credential file.
+
+Both the dashboard and its configured API must use HTTPS. The API's
+`PUBLIC_BASE_URL` must be its canonical HTTPS origin, and `CORS_ORIGINS` must
+include the exact HTTPS dashboard origin. Ordinary admin/viewer accounts cannot
+import credentials. The upload is limited to 1 MiB, checks the signed identity and
+plan-use metadata, and stores the accepted registration only in the existing
+protected auth volume. It preserves the VM host ID and never returns token values.
+
+Import does not run inference or select a model/provider. After success, refresh
+the model list and explicitly choose the account and model. If the response is
+lost, refresh the connection before doing anything else; the browser never retries
+an upload automatically. A conflicting upload cannot replace the tokens of an
+existing working registration. Do not delete working credentials merely to retry.
+
+#### SSH transfer (optional operator route)
 
 Create a private staging directory on your VM, then transfer only this selected
 registration over SSH. Replace `OWNER@VM` with your verified SSH destination;

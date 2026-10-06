@@ -1,27 +1,32 @@
 """Admin controls for a host-local ChatGPT plan registration.
 
 OAuth is deliberately absent from this public web server: the documented direct
-flow uses a loopback callback on the computer running the user's browser. Tokens
-stay in protected host storage and never pass through dashboard requests.
+flow uses a loopback callback on the computer running the user's browser. A signed-in
+owner can explicitly transfer one existing registration through the HTTPS import
+route. Tokens stay in protected host storage and are never returned to the dashboard.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse, Response
 
 from agent.chatgpt_auth import ChatGPTAuthError, ChatGPTAuthStore
 from agent.config import chatgpt_auth_directory, environment_values
 from api.errors import envelope_response
-from api.security.permissions import WorkspaceContext, require_admin
+from api.security.permissions import WorkspaceContext, require_admin, require_owner
 from api.settings import store
 
 router = APIRouter(prefix="/api/settings/chatgpt", tags=["settings"])
+MAX_IMPORT_BYTES = 1024 * 1024
 
 
 def auth_store() -> ChatGPTAuthStore:
@@ -29,7 +34,7 @@ def auth_store() -> ChatGPTAuthStore:
     return ChatGPTAuthStore(chatgpt_auth_directory())
 
 
-async def _status(request: Request) -> dict[str, Any]:
+async def _status(request: Request, *, can_import: bool = False) -> dict[str, Any]:
     state = await asyncio.to_thread(auth_store().status)
     db = request.state.db
     environment = environment_values()
@@ -52,7 +57,32 @@ async def _status(request: Request) -> dict[str, Any]:
         "reason": None if connected else "chatgpt_not_connected",
         "provider": await store.get(db, "llm.provider") or environment["provider"] or None,
         "model": await store.get(db, "llm.model") or environment["model"] or None,
+        "can_import": can_import and _https_import_configured(request),
     }
+
+
+def _https_import_configured(request: Request) -> bool:
+    """Use the operator's canonical HTTPS origin, never untrusted proxy headers."""
+    public = request.app.state.settings.public_base_url
+    if not isinstance(public, str):
+        return False
+    try:
+        canonical = urlsplit(public)
+        return (
+            canonical.scheme == "https"
+            and bool(canonical.hostname)
+            and not (canonical.username or canonical.password)
+            and canonical.hostname == request.url.hostname
+            and (canonical.port or 443) == (request.url.port or 443)
+        )
+    except ValueError:
+        return False
+
+
+def _import_error(status: int, code: str, message: str) -> Response:
+    response = envelope_response(status_code=status, code=code, message=message)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _auth_error() -> object:
@@ -68,9 +98,103 @@ async def connection_status(
     request: Request, context: Annotated[WorkspaceContext, require_admin]
 ) -> object:
     try:
-        return await _status(request)
+        return await _status(request, can_import=context.outranks_or_is("owner"))
     except ChatGPTAuthError:
         return _auth_error()
+
+
+@router.post("/import", summary="Owner-uploaded ChatGPT registration over HTTPS")
+async def import_account(
+    request: Request, context: Annotated[WorkspaceContext, require_owner]
+) -> Response:
+    """Accept one explicit browser upload; never parse credentials into an API model.
+
+    Raw bytes avoid validation errors echoing token fields. This endpoint adds a
+    stricter origin check than ordinary API routes, including refusing absent Origin.
+    The owner's browser selects and submits the file; there is no URL/path importer.
+    """
+    if not _https_import_configured(request):
+        return _import_error(
+            409, "chatgpt_import_insecure", "Account import requires the configured HTTPS API."
+        )
+    origin = request.headers.get("origin", "")
+    if (
+        not origin.startswith("https://")
+        or origin not in request.app.state.settings.cors_origins
+        or request.headers.get("x-tel-agent-import") != "1"
+    ):
+        return _import_error(
+            403, "forbidden", "Use the signed-in HTTPS dashboard to import an account."
+        )
+    if (
+        request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        != "application/octet-stream"
+        or request.url.query
+    ):
+        return _import_error(
+            415, "chatgpt_import_invalid", "Choose one ChatGPT registration JSON file."
+        )
+    data = await request.body()
+    if not data or len(data) > MAX_IMPORT_BYTES:
+        return _import_error(
+            413, "chatgpt_import_invalid", "The registration file is empty or too large."
+        )
+
+    # Keep at most one import worker per process, including after a disconnected
+    # request. The auth store's OS lock additionally protects other API processes.
+    lock = getattr(request.app.state, "chatgpt_import_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.chatgpt_import_lock = lock
+    if lock.locked():
+        return _import_error(
+            409, "chatgpt_import_in_progress", "An account import is already in progress."
+        )
+    await lock.acquire()
+    cancelled = threading.Event()
+
+    def transfer() -> dict[str, Any]:
+        return auth_store().import_registration_bytes(data, cancelled=cancelled.is_set)
+
+    worker = asyncio.create_task(asyncio.to_thread(transfer))
+    request.app.state.chatgpt_import_worker = worker
+
+    def finished(task: asyncio.Task[dict[str, Any]]) -> None:
+        # Consume background failures without printing exception text or credential
+        # locals after a browser disconnect or the request middleware's timeout.
+        if not task.cancelled():
+            task.exception()
+        request.app.state.chatgpt_import_worker = None
+        lock.release()
+
+    worker.add_done_callback(finished)
+    try:
+        await asyncio.shield(worker)
+        state = await _status(request, can_import=True)
+        return JSONResponse(state, headers={"Cache-Control": "no-store"})
+    except ChatGPTAuthError as error:
+        if error.code in {"import_conflict", "registration_conflict", "account_changed"}:
+            return _import_error(
+                409,
+                "chatgpt_import_conflict",
+                "A working registration already exists. It was not replaced.",
+            )
+        return _import_error(
+            422,
+            "chatgpt_import_failed",
+            "The account could not be imported. Check the selected registration and refresh "
+            "the connection before trying again.",
+        )
+    except Exception:
+        # No raw upstream, JSON, filesystem or unexpected exception may expose the
+        # upload in diagnostics. A lost response may follow a successful atomic write.
+        return _import_error(
+            503,
+            "chatgpt_import_failed",
+            "The import result could not be confirmed. Refresh the connection before retrying.",
+        )
+    finally:
+        cancelled.set()
 
 
 async def model_catalog(client_id: str | None) -> list[dict[str, str]]:
@@ -159,7 +283,7 @@ async def select_account(
         await store.set_value(db, "llm.model", payload.model)
         await store.set_value(db, "llm.provider", "chatgpt_plan")
         await db.commit()
-        return await _status(request)
+        return await _status(request, can_import=context.outranks_or_is("owner"))
     except ChatGPTAuthError:
         return _auth_error()
     except (httpx.HTTPError, ValueError, TimeoutError):

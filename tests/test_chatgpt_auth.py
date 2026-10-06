@@ -10,7 +10,9 @@ import io
 import json
 import multiprocessing
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -935,7 +937,7 @@ def test_vm_import_allows_expired_verified_identity_hint(store, issuer, tmp_path
     login(store, issuer)
     source = store._record_path(CLIENT)
     incoming = _read_private(source)
-    incoming["id_token"] = issuer.identity(exp=int(time.time()) - 60)
+    incoming["id_token"] = issuer.identity(exp=int(time.time()) - 60, nonce=incoming["nonce"])
     _atomic_private(source, incoming)
     vm = ChatGPTAuthStore(tmp_path / "vm", transport=httpx.MockTransport(issuer))
     assert vm.import_registration(source)["connected"]
@@ -1017,3 +1019,431 @@ def test_invalid_grant_restarts_authorization_once_with_issued_client(
         assert first[key] != second[key]
     assert first["redirect_uri"] == second["redirect_uri"]
     assert len(store.accounts()) == 1
+
+
+def registration_payload(issuer, /, **changes):
+    """A disposable registration assembled without authorizing or refreshing."""
+    now = time.time()
+    return {
+        "version": 1,
+        "issuer": ISSUER,
+        "client_id": CLIENT,
+        "subject": "subject-one",
+        "email": "same@example.test",
+        "label": "Personal",
+        "ext_agent_host_id": "urn:uuid:11111111-1111-4111-8111-111111111111",
+        "revision": "synthetic-source-revision",
+        "nonce": "nonce",
+        "access_token": ACCESS,
+        "refresh_token": REFRESH,
+        "id_token": issuer.identity(),
+        "token_type": "Bearer",
+        "scopes": SCOPES.split(),
+        "saved_at": now - 5,
+        "expires_at": now + 3600,
+        "earliest_refresh_at": 0,
+        **changes,
+    }
+
+
+def test_bytes_import_preserves_host_and_returns_only_safe_metadata(store, issuer, caplog):
+    host_id = store.init_host()
+    incoming = registration_payload(issuer)
+    result = store.import_registration_bytes(json.dumps(incoming).encode())
+    saved = _read_private(store._record_path(CLIENT))
+    assert saved["ext_agent_host_id"] == host_id != incoming["ext_agent_host_id"]
+    assert saved["revision"] != incoming["revision"]
+    assert saved["email"] == "same@example.test"
+    assert result["connected"] and result["selected"]
+    assert result["label"] == "Personal"
+    assert store.status()["selected_client_id"] == CLIENT
+    assert store._record_path(CLIENT).stat().st_mode & 0o777 == 0o600
+    assert store.directory.stat().st_mode & 0o777 == 0o700
+    assert {str(request.url) for request in issuer.requests} == {DISCOVERY_URL, JWKS}
+    assert all(request.method == "GET" and not request.content for request in issuer.requests)
+    for token in (ACCESS, REFRESH, incoming["id_token"]):
+        assert token not in json.dumps(result)
+        assert token not in json.dumps(store.status())
+        assert token not in caplog.text
+    assert not list(store.directory.glob(".pending-*"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"",
+        b"not JSON",
+        b"null",
+        b"[]",
+        b'"synthetic-access-value"',
+        b'{"access_token":"synthetic-access-value",}',
+        b'{"access_token":"synthetic-access-value","access_token":"second"}',
+        b'{"nested":{"a":1,"a":2}}',
+        b'{"access_token":1,"access_\\u0074oken":2}',
+        b'{"expires_at":NaN}',
+        b'{"expires_at":Infinity}',
+        b'{"expires_at":-Infinity}',
+        b'{"expires_at":1e10000}',
+        b'{"value":"\\ud800"}',
+        b'{"\\ud800":"value"}',
+        b'{"value":"\xff"}',
+        b"\xef\xbb\xbf{}",
+        "{}".encode("utf-16"),
+        b'{"nested":' + b"[" * 17 + b"0" + b"]" * 17 + b"}",
+        b"[" * 2000,
+        b" " * (1024 * 1024 + 1),
+    ],
+)
+def test_bytes_import_rejects_ambiguous_json_without_files_or_network(
+    store, issuer, body, caplog
+):
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(body)
+    assert error.value.code == "invalid_storage"
+    assert ACCESS not in str(error.value)
+    assert ACCESS not in caplog.text
+    assert not store.directory.exists()
+    assert issuer.requests == []
+
+
+@pytest.mark.parametrize("body", [None, "{}", bytearray(b"{}")])
+def test_bytes_import_rejects_non_bytes(store, body):
+    with pytest.raises(ChatGPTAuthError, match="invalid"):
+        store.import_registration_bytes(body)
+    assert not store.directory.exists()
+
+
+def test_bytes_import_accepts_exact_size_limit(store, issuer):
+    body = json.dumps(registration_payload(issuer)).encode()
+    body += b" " * (1024 * 1024 - len(body))
+    assert store.import_registration_bytes(body)["connected"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("version", True),
+        ("version", 2),
+        ("issuer", "https://other.example"),
+        ("client_id", "dynamic_agent_client"),
+        ("subject", []),
+        ("label", {"nested": REFRESH}),
+        ("label", "x" * 201),
+        ("label", "unsafe\nlabel"),
+        ("label", f"Account: {ACCESS}"),
+        ("label", f"Account: {REFRESH}"),
+        ("email", "x" * 321),
+        ("email", "different@example.test"),
+        ("email", REFRESH),
+        ("nonce", 7),
+        ("nonce", "wrong"),
+        ("ext_agent_host_id", {"nested": REFRESH}),
+        ("revision", [REFRESH]),
+        ("access_token", "invalid\ntoken"),
+        ("access_token", "x" * (128 * 1024 + 1)),
+        ("refresh_token", None),
+        ("token_type", "Basic"),
+        ("token_type", ["Bearer"]),
+        ("scopes", "resource.invoke chatgpt.tokens.use.direct"),
+        ("scopes", ["openid"]),
+        ("scopes", [*SCOPES.split(), "resource.invoke"]),
+        ("scopes", [*SCOPES.split(), ACCESS]),
+        ("scopes", [*SCOPES.split(), "a b"]),
+        ("scopes", [*SCOPES.split(), "a\\b"]),
+        ("scopes", [*SCOPES.split(), 'a"b']),
+        ("scopes", [*SCOPES.split(), "x" * 257]),
+        ("scopes", SCOPES.split() + [str(i) for i in range(65)]),
+        ("scopes", [*SCOPES.split(), []]),
+        ("expires_at", True),
+        ("expires_at", 0),
+        ("expires_at", "3600"),
+        ("expires_at", 1e12),
+        ("saved_at", False),
+        ("saved_at", -1),
+        pytest.param("saved_at", time.time() + 86400, id="future-saved-at"),
+        ("earliest_refresh_at", "never"),
+        ("earliest_refresh_at", -1),
+        ("api_key", REFRESH),
+        ("client_secret", REFRESH),
+        ("unknown_metadata", REFRESH),
+    ],
+)
+def test_bytes_import_rejects_bad_schema_without_damaging_existing_account(
+    store, issuer, field, value, caplog
+):
+    store.import_registration_bytes(json.dumps(registration_payload(issuer)).encode())
+    before = {path.name: path.read_bytes() for path in store.directory.glob("*.json")}
+    incoming = registration_payload(issuer, **{field: value})
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(json.dumps(incoming).encode())
+    assert ACCESS not in str(error.value) and REFRESH not in str(error.value)
+    assert ACCESS not in caplog.text and REFRESH not in caplog.text
+    assert {path.name: path.read_bytes() for path in store.directory.glob("*.json")} == before
+    assert store.status()["connected"]
+
+
+@pytest.mark.parametrize("claim", ["iss", "aud", "sub"])
+def test_bytes_import_rejects_signed_identity_mismatch(store, issuer, claim):
+    overrides = {"iss": "https://other.example", "aud": OTHER, "sub": "subject-two"}
+    incoming = registration_payload(
+        issuer, id_token=issuer.identity(**{claim: overrides[claim]})
+    )
+    with pytest.raises(ChatGPTAuthError):
+        store.import_registration_bytes(json.dumps(incoming).encode())
+    assert not store.directory.exists()
+
+
+@pytest.mark.parametrize("at_hash", [None, 12, "wrong", "correct"])
+def test_bytes_import_validates_optional_signed_access_hash(store, issuer, at_hash):
+    expected = base64.urlsafe_b64encode(hashlib.sha256(ACCESS.encode()).digest()[:16])
+    identity = issuer.identity(
+        at_hash=expected.rstrip(b"=").decode() if at_hash == "correct" else at_hash
+    )
+    incoming = registration_payload(issuer, id_token=identity)
+    if at_hash == "correct":
+        assert store.import_registration_bytes(json.dumps(incoming).encode())["connected"]
+    else:
+        with pytest.raises(ChatGPTAuthError) as error:
+            store.import_registration_bytes(json.dumps(incoming).encode())
+        assert error.value.code == "invalid_identity"
+        assert not store.directory.exists()
+
+
+def test_bytes_import_allows_expired_hint_and_access_without_refreshing(store, issuer):
+    incoming = registration_payload(
+        issuer, id_token=issuer.identity(exp=int(time.time()) - 60), expires_at=time.time() - 1
+    )
+    assert store.import_registration_bytes(json.dumps(incoming).encode())["connected"]
+    assert all(request.method == "GET" for request in issuer.requests)
+
+
+def test_bytes_import_idempotency_preserves_current_tokens_and_metadata(store, issuer):
+    incoming = registration_payload(issuer)
+    store.import_registration_bytes(json.dumps(incoming).encode())
+    before = {path.name: path.read_bytes() for path in store.directory.glob("*.json")}
+    incoming.update(saved_at=time.time(), expires_at=time.time() + 7200, label="Replacement")
+    result = store.import_registration_bytes(json.dumps(incoming).encode())
+    assert result["label"] == "Personal"
+    assert {path.name: path.read_bytes() for path in store.directory.glob("*.json")} == before
+
+
+@pytest.mark.parametrize("newer_timestamp", [False, True])
+def test_bytes_import_cannot_replace_working_credentials_even_with_forged_timestamp(
+    store, issuer, newer_timestamp
+):
+    incoming = registration_payload(issuer)
+    store.import_registration_bytes(json.dumps(incoming).encode())
+    before = {path.name: path.read_bytes() for path in store.directory.glob("*.json")}
+    other_access, other_refresh = "other-synthetic-access", "other-synthetic-refresh"
+    incoming.update(
+        access_token=other_access,
+        refresh_token=other_refresh,
+        saved_at=time.time() + 60 if newer_timestamp else time.time() - 60,
+        expires_at=time.time() + 7200,
+    )
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(json.dumps(incoming).encode())
+    assert error.value.code == "account_changed"
+    assert {path.name: path.read_bytes() for path in store.directory.glob("*.json")} == before
+
+
+def test_bytes_import_cannot_change_subject_of_existing_client(store, issuer):
+    store.import_registration_bytes(json.dumps(registration_payload(issuer)).encode())
+    before = store._record_path(CLIENT).read_bytes()
+    incoming = registration_payload(
+        issuer, subject="subject-two", id_token=issuer.identity(subject="subject-two")
+    )
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(json.dumps(incoming).encode())
+    assert error.value.code == "identity_mismatch"
+    assert store._record_path(CLIENT).read_bytes() == before
+
+
+def test_bytes_import_cannot_roll_back_concurrent_refresh(store, issuer, monkeypatch):
+    incoming = registration_payload(issuer)
+    store.import_registration_bytes(json.dumps(incoming).encode())
+    original_validate = store._validated_import
+    refreshed = {}
+    replacement_access, replacement_refresh = "refreshed-access", "refreshed-refresh"
+
+    def validate_then_refresh(value):
+        verified = original_validate(value)
+        issuer.tokens = issuer.response()
+        issuer.tokens.update(access_token=replacement_access, refresh_token=replacement_refresh)
+        store._access_token(CLIENT, force_refresh=True)
+        refreshed.update(_read_private(store._record_path(CLIENT)))
+        return verified
+
+    monkeypatch.setattr(store, "_validated_import", validate_then_refresh)
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(json.dumps(incoming).encode())
+    assert error.value.code == "account_changed"
+    assert _read_private(store._record_path(CLIENT)) == refreshed
+    assert refreshed["access_token"] == replacement_access
+
+
+def test_bytes_import_cancelled_before_validation_has_no_effect(store, issuer):
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(b"{}", cancelled=lambda: True)
+    assert error.value.code == "import_cancelled"
+    assert not store.directory.exists()
+    assert issuer.requests == []
+
+
+def test_bytes_import_cancelled_during_jwks_has_no_effect(store, issuer):
+    cancelled = threading.Event()
+
+    def transport(request):
+        response = issuer(request)
+        if str(request.url) == JWKS:
+            cancelled.set()
+        return response
+
+    store._transport = httpx.MockTransport(transport)
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(
+            json.dumps(registration_payload(issuer)).encode(), cancelled=cancelled.is_set
+        )
+    assert error.value.code == "import_cancelled"
+    assert not store.directory.exists()
+
+
+def test_bytes_import_cancelled_while_waiting_for_refresh_lock_has_no_effect(
+    store, issuer, monkeypatch
+):
+    store.init_host()
+    before = (store.directory / "host.json").read_bytes()
+    cancelled, validated = threading.Event(), threading.Event()
+    original_validate = store._validated_import
+
+    def validate(value):
+        result = original_validate(value)
+        validated.set()
+        return result
+
+    monkeypatch.setattr(store, "_validated_import", validate)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with store._locked():
+            future = executor.submit(
+                store.import_registration_bytes,
+                json.dumps(registration_payload(issuer)).encode(),
+                cancelled=cancelled.is_set,
+            )
+            assert validated.wait(timeout=5)
+            cancelled.set()
+        with pytest.raises(ChatGPTAuthError) as error:
+            future.result(timeout=5)
+    assert error.value.code == "import_cancelled"
+    assert (store.directory / "host.json").read_bytes() == before
+    assert not store._record_path(CLIENT).exists()
+
+
+def test_cli_import_uses_shared_validation_and_permits_explicit_newer_replacement(
+    store, issuer, tmp_path
+):
+    source = tmp_path / "synthetic-registration.json"
+    incoming = registration_payload(issuer)
+    _atomic_private(source, incoming)
+    assert store.import_registration(source)["connected"]
+    newer_access, newer_refresh = "newer-synthetic-access", "newer-synthetic-refresh"
+    incoming.update(
+        access_token=newer_access,
+        refresh_token=newer_refresh,
+        saved_at=time.time(),
+        expires_at=time.time() + 7200,
+    )
+    _atomic_private(source, incoming)
+    store.import_registration(source)
+    assert _read_private(store._record_path(CLIENT))["refresh_token"] == newer_refresh
+    incoming["saved_at"] = time.time() - 60
+    incoming["refresh_token"] = REFRESH
+    _atomic_private(source, incoming)
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration(source)
+    assert error.value.code == "account_changed"
+    assert _read_private(store._record_path(CLIENT))["refresh_token"] == newer_refresh
+    incoming["client_secret"] = REFRESH
+    _atomic_private(source, incoming)
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration(source)
+    assert error.value.code == "invalid_storage"
+
+
+@pytest.mark.parametrize("token", ['synthetic-"quoted"-access', "synthetic-\\-access"])
+def test_bytes_import_rejects_json_escaped_token_reflection(store, issuer, token):
+    incoming = registration_payload(issuer, access_token=token, label=f"Account: {token}")
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(json.dumps(incoming).encode())
+    assert error.value.code == "invalid_storage"
+    assert token not in str(error.value)
+    assert not store.directory.exists()
+
+
+def test_bytes_import_cannot_upgrade_existing_grant_by_changing_unsigned_scopes(store, issuer):
+    login(store, issuer, scope="openid profile email offline_access")
+    incoming = _read_private(store._record_path(CLIENT))
+    incoming["scopes"] = SCOPES.split()
+    before = {path.name: path.read_bytes() for path in store.directory.glob("*.json")}
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(json.dumps(incoming).encode())
+    assert error.value.code == "plan_permission_missing"
+    assert {path.name: path.read_bytes() for path in store.directory.glob("*.json")} == before
+    assert store.status()["selected_client_id"] is None
+
+
+def test_bytes_import_write_failure_is_sanitized_and_preserves_active_registration(
+    store, issuer, monkeypatch
+):
+    store.import_registration_bytes(json.dumps(registration_payload(issuer)).encode())
+    before = {path.name: path.read_bytes() for path in store.directory.glob("*.json")}
+    incoming = registration_payload(
+        issuer, client_id=OTHER, id_token=issuer.identity(client_id=OTHER)
+    )
+
+    def fail(*args):
+        raise PermissionError(REFRESH)
+
+    monkeypatch.setattr("agent.chatgpt_auth._atomic_private", fail)
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(json.dumps(incoming).encode())
+    assert error.value.code == "storage_unavailable"
+    assert REFRESH not in str(error.value)
+    assert {path.name: path.read_bytes() for path in store.directory.glob("*.json")} == before
+
+
+def test_bytes_import_cancelled_after_commit_does_not_change_active_selection(
+    store, issuer, monkeypatch
+):
+    store.import_registration_bytes(json.dumps(registration_payload(issuer)).encode())
+    before = (store.directory / "host.json").read_bytes()
+    cancelled = threading.Event()
+    incoming = registration_payload(
+        issuer, client_id=OTHER, id_token=issuer.identity(client_id=OTHER)
+    )
+
+    def commit_then_cancel(path, value):
+        _atomic_private(path, value)
+        cancelled.set()
+
+    monkeypatch.setattr("agent.chatgpt_auth._atomic_private", commit_then_cancel)
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration_bytes(
+            json.dumps(incoming).encode(), cancelled=cancelled.is_set
+        )
+    assert error.value.code == "import_cancelled"
+    assert (store.directory / "host.json").read_bytes() == before
+    assert store.status()["selected_client_id"] == CLIENT
+    # The completed atomic write cannot be undone by cancelling the worker.
+    assert store._record_path(OTHER).exists()
+    assert any(account["client_id"] == OTHER for account in store.status()["accounts"])
+
+
+def test_cli_import_rejects_duplicate_keys_using_shared_parser(store, tmp_path):
+    source = tmp_path / "duplicate-synthetic-registration.json"
+    source.write_bytes(b'{"access_token":"synthetic-access-value","access_token":"other"}')
+    source.chmod(0o600)
+    with pytest.raises(ChatGPTAuthError) as error:
+        store.import_registration(source)
+    assert error.value.code == "invalid_storage"
+    assert ACCESS not in str(error.value)
+    assert not store.directory.exists()

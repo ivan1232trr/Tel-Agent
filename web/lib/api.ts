@@ -478,8 +478,9 @@ export type ChatGPTPlanAccount = {
   selected: boolean;
 };
 
-/** Safe local registration metadata only. Credentials never enter the browser. */
+/** Safe local registration metadata only. Credentials are never returned. */
 export type ChatGPTPlanStatus = {
+  can_import: boolean;
   connected: boolean;
   selected_client_id: string | null;
   accounts: ChatGPTPlanAccount[];
@@ -492,6 +493,61 @@ export type ChatGPTPlanModel = { slug: string; display_name: string };
 
 export function chatgptPlanStatus(): Promise<ChatGPTPlanStatus> {
   return api("/api/settings/chatgpt");
+}
+
+export const CHATGPT_IMPORT_MAX_BYTES = 1024 * 1024;
+
+export class ChatGPTPlanImportError extends Error {
+  constructor(readonly kind: "insecure" | "file" | "forbidden" | "rejected" | "unknown") {
+    // Never retain a response body, filename, or credential in an error.
+    super("The registration import could not be confirmed.");
+    this.name = "ChatGPTPlanImportError";
+  }
+}
+
+/** No HTTP or localhost exception: credentials may only cross HTTPS. */
+export function chatgptPlanImportAllowed(): boolean {
+  if (typeof window === "undefined" || !window.isSecureContext || window.location.protocol !== "https:") return false;
+  try {
+    const target = new URL(API_URL);
+    return target.protocol === "https:" && !target.username && !target.password && !target.search && !target.hash;
+  } catch {
+    return false;
+  }
+}
+
+/** The user selects and explicitly submits the file. Its contents stay opaque. */
+export async function importChatGPTPlan(file: File): Promise<ChatGPTPlanStatus> {
+  if (!chatgptPlanImportAllowed()) throw new ChatGPTPlanImportError("insecure");
+  if (file.size === 0 || file.size > CHATGPT_IMPORT_MAX_BYTES) throw new ChatGPTPlanImportError("file");
+  const workspaceId = activeWorkspaceId();
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}/api/settings/chatgpt/import`, {
+      method: "POST",
+      credentials: "include",
+      redirect: "error",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Tel-Agent-Import": "1",
+        ...(workspaceId === null ? {} : { "X-Workspace-Id": String(workspaceId) }),
+      },
+      body: file,
+    });
+  } catch {
+    // A lost response can follow a successful write. Never retry the upload.
+    throw new ChatGPTPlanImportError("unknown");
+  }
+  if (!response.ok) {
+    // Do not parse or surface error bodies from a credential-handling endpoint.
+    throw new ChatGPTPlanImportError(response.status === 403 ? "forbidden" : response.status >= 500 ? "unknown" : "rejected");
+  }
+  try {
+    return await response.json() as ChatGPTPlanStatus;
+  } catch {
+    throw new ChatGPTPlanImportError("unknown");
+  }
 }
 
 /** Explicit operator action: this asks ChatGPT for this registration's models. */
